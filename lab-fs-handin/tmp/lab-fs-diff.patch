@@ -1,0 +1,328 @@
+diff --git a/Makefile b/Makefile
+index 7a7e380..ba79950 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,7 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++        $U/_symlinktest\
+ 
+ 
+ 
+diff --git a/kernel/fcntl.h b/kernel/fcntl.h
+index 44861b9..1b7a1aa 100644
+--- a/kernel/fcntl.h
++++ b/kernel/fcntl.h
+@@ -3,3 +3,4 @@
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
+ #define O_TRUNC   0x400
++#define O_NOFOLLOW 0x800  // add
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..8ab5f61 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -26,7 +26,7 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+2]; // 1->2
+ };
+ 
+ // map major device number to device functions.
+diff --git a/kernel/fs.c b/kernel/fs.c
+index 40c9bd4..36b41e1 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -400,6 +400,39 @@ bmap(struct inode *ip, uint bn)
+     brelse(bp);
+     return addr;
+   }
++  
++  //add
++  bn -= NINDIRECT;
++  if(bn < NBINDIRECT){
++    if((addr = ip->addrs[DINDIRECT_PTR])  == 0){
++      addr = balloc(ip->dev);
++      if(addr == 0)
++	return 0;
++      ip->addrs[DINDIRECT_PTR] = addr;  // 分配新块
++    }
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    if((addr = a[bn / NINDIRECT]) == 0){ 
++      addr = balloc(ip->dev);
++      if(addr){
++	a[bn / NINDIRECT] = addr;
++        log_write(bp);
++      }
++    }
++    brelse(bp);
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    if((addr = a[bn % NINDIRECT]) == 0){
++      addr = balloc(ip->dev);
++      if(addr){
++	a[bn % NINDIRECT] = addr;
++        log_write(bp);
++      }
++    }
++    brelse(bp);
++    return addr;
++  }
++  //add
+ 
+   panic("bmap: out of range");
+ }
+@@ -410,8 +443,8 @@ void
+ itrunc(struct inode *ip)
+ {
+   int i, j;
+-  struct buf *bp;
+-  uint *a;
++  struct buf *bp, *subbp; //change
++  uint *a,*b; //change
+ 
+   for(i = 0; i < NDIRECT; i++){
+     if(ip->addrs[i]){
+@@ -431,7 +464,28 @@ itrunc(struct inode *ip)
+     bfree(ip->dev, ip->addrs[NDIRECT]);
+     ip->addrs[NDIRECT] = 0;
+   }
+-
++  //add
++  if(ip->addrs[DINDIRECT_PTR]){
++    bp = bread(ip->dev, ip->addrs[DINDIRECT_PTR]);
++    a = (uint*)bp->data;
++    for(i = 0; i < NINDIRECT; i++){
++      if(a[i]){
++        subbp = bread(ip->dev, a[i]);
++        b = (uint*)subbp->data;
++        for(j = 0; j < NINDIRECT; j++)
++	  if(b[j])
++	    bfree(ip->dev, b[j]);
++        brelse(subbp);
++        bfree(ip->dev, a[i]);
++        a[i] = 0;
++      }
++    }
++    brelse(bp);
++    bfree(ip->dev, ip->addrs[DINDIRECT_PTR]);
++    ip->addrs[DINDIRECT_PTR] = 0;
++  }
++  //add
++    
+   ip->size = 0;
+   iupdate(ip);
+ }
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..97dc1e6 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -24,10 +24,14 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
++//#define NDIRECT 12
++#define NDIRECT 11  // change
+ #define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++#define NBINDIRECT (BSIZE / sizeof(uint)) * (BSIZE / sizeof(uint))  // add:增加二级索引表示的文件大小
++//#define MAXFILE (NDIRECT + NINDIRECT)
++#define MAXFILE (NDIRECT + NINDIRECT + NBINDIRECT)  // change: 前面系数都为1,表示11个直接索引，1个间接索引，1个二级索引表示的文件的最大范围
+ 
++#define DINDIRECT_PTR 12  // add
+ // On-disk inode structure
+ struct dinode {
+   short type;           // File type
+@@ -35,7 +39,7 @@ struct dinode {
+   short minor;          // Minor device number (T_DEVICE only)
+   short nlink;          // Number of links to inode in file system
+   uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  uint addrs[NDIRECT+2];   // Data block addresses(1->2)
+ };
+ 
+ // Inodes per block.
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..56e44ae 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -1,6 +1,7 @@
+ #define T_DIR     1   // Directory
+ #define T_FILE    2   // File
+ #define T_DEVICE  3   // Device
++#define T_SYMLINK 4   // add
+ 
+ struct stat {
+   int dev;     // File system's disk device
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..9bb144c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_symlink(void);  // add
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +128,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_symlink] sys_symlink,  // add
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..82881e5 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_symlink 22  // add
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..466df28 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -16,6 +16,59 @@
+ #include "file.h"
+ #include "fcntl.h"
+ 
++uint64  // add
++sys_symlink(void)
++{
++  char name[DIRSIZ], target[MAXPATH], path[MAXPATH];
++  struct inode *dp, *ip, *sym;
++  //ip指向target dp指向path的父目录
++  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
++      return -1;
++  
++  begin_op();
++  // 提示要求target指定的文件是可以不存在的
++  if((ip = namei(target)) != 0){
++    ilock(ip);
++    // 根据提示，不需要处理target是一个目录文件的情况
++    if(ip->type == T_DIR){
++      iunlockput(ip);
++      end_op();	
++      return -1;
++    }
++    iunlockput(ip);
++  }
++  //获取path的父目录
++  if((dp = nameiparent(path, name)) == 0){
++    end_op();
++    return -1;
++  }
++  ilock(dp);
++  //如果有同名文件，则生成失败
++  if((sym = dirlookup(dp, name, 0)) != 0){
++    iunlockput(dp);	  
++    end_op();
++    return -1;
++  }
++  //仿照create生成符号链接类型的inode
++  if((sym = ialloc(dp->dev, T_SYMLINK)) == 0)
++    panic("create: ialloc");
++  ilock(sym);
++  sym->nlink = 1;
++  iupdate(sym);
++  //把符号链接文件加入到path的父目录中
++  if(dirlink(dp, name,sym->inum) < 0) 
++    panic("create: dirlink");
++  iupdate(dp);
++  //把target字符串写入符号链接文件里面
++  if(writei(sym, 0, (uint64)&target, 0, strlen(target)) != strlen(target))
++    panic("symlink: writei");	  
++  iupdate(sym);//注意调用iupdate把inode信息写入磁盘
++  iunlockput(dp);
++  iunlockput(sym);
++  end_op();
++  return 0;
++}
++
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -296,7 +349,7 @@ sys_open(void)
+     return -1;
+ 
+   begin_op();
+-
++  
+   if(omode & O_CREATE){
+     ip = create(path, T_FILE, 0, 0);
+     if(ip == 0){
+@@ -309,6 +362,32 @@ sys_open(void)
+       return -1;
+     }
+     ilock(ip);
++    if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
++      int max_depth = 10;
++      char target[MAXPATH];
++      int found = 0;
++      for(int i = 0; i < max_depth; i++) {
++	if(readi(ip, 0, (uint64)target, 0, MAXPATH) < 0) {
++	  iunlockput(ip);
++          end_op();
++          return -1;
++	}
++        iunlockput(ip);
++        ip = namei(target);
++        if(ip == 0) break;	
++	if(ip->type == T_SYMLINK) ilock(ip);
++	else{
++	  found = 1;
++          ilock(ip);
++          break;
++	}
++      }
++      if(!found){
++	end_op();
++        return -1;
++      }
++    }
++    
+     if(ip->type == T_DIR && omode != O_RDONLY){
+       iunlockput(ip);
+       end_op();
+@@ -341,6 +420,7 @@ sys_open(void)
+   f->readable = !(omode & O_WRONLY);
+   f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+ 
++  
+   if((omode & O_TRUNC) && ip->type == T_FILE){
+     itrunc(ip);
+   }
+diff --git a/user/user.h b/user/user.h
+index b71ecda..e224089 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,7 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+-
++int symlink(char*, char*);  // add
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..616d7af 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("symlink"); 
++
