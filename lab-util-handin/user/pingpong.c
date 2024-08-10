@@ -12,7 +12,7 @@ int main(){
         if(read(p1[0], buf, 4) != 4){
 	    fprintf(2, "child read error\n");
 	    exit(1);
-	}
+	    }
         close(p1[0]);
         fprintf(0, "%d: received ping\n", getpid());
 
